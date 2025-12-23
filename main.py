@@ -22,13 +22,13 @@ app.add_middleware(
 )
 
 # --- 1. LOAD MODEL & SCALERS ---
-# Load resources sekali saat startup agar efisien
 try:
-    model = tf.keras.models.load_model('model/lstm_N_model.h5')
+    # compile=False agar tidak error metric mse
+    model = tf.keras.models.load_model('model/lstm_model.h5', compile=False)
     print("✅ Model loaded successfully.")
 except Exception as e:
     print(f"❌ Error loading model: {e}")
-    model = None # Handle jika model gagal load
+    model = None
 
 try:
     sc_dyn = joblib.load('model/scaler_dynamic.pkl')
@@ -44,36 +44,51 @@ class PredictionInput(BaseModel):
     dynamic_data: List[List[float]] 
     static_data: List[float]
 
-# --- 3. HELPER FUNCTION ---
+# --- 3. HELPER FUNCTION (YANG DIPERBAIKI) ---
 def generate_recommendation(n_rel_val):
-    # Hitung estimasi kandungan N saat ini (dikonversi ke satuan kg/ha Urea)
-    current_n_status = 275 + (n_rel_val * 62.5) 
-    current_n_status = max(200, min(400, current_n_status))
+    # 1. Hitung Status Skor (Angka asli status tanah)
+    n_status_score = 275 + (n_rel_val * 62.5) 
+    
+    # Inisialisasi variabel agar aman
+    final_dose = 0
+    kategori = ""
+    rekomendasi_text = ""
 
-    # Tentukan rekomendasi pupuk BERDASARKAN status tadi
-    if current_n_status <= 200:
+    # 2. Logika Penentuan Dosis (Konsisten menggunakan 'rekomendasi_text' & 'final_dose')
+    if n_status_score <= 200:
         kategori = "Sangat Rendah"
-        saran_pupuk = "Tambahkan ≥ 350 kg/ha"
-    elif current_n_status <= 250:
+        final_dose = 350
+        rekomendasi_text = "Tambahkan ≥ 350 kg/ha"
+        
+    elif n_status_score <= 250:
         kategori = "Rendah"
-        saran_pupuk = "Tambahkan 200–250 kg/ha"
-    elif current_n_status <= 300:
+        final_dose = 300
+        rekomendasi_text = "Tambahkan 300-350 kg/ha" # Ditinggikan agar sesuai kebutuhan
+        
+    elif n_status_score <= 300:
         kategori = "Sedang"
-        saran_pupuk = "Tambahkan 250–300 kg/ha (Standar)"
-    elif current_n_status <= 350:
+        final_dose = 275
+        rekomendasi_text = "Kondisi ideal. Pertahankan dosis standar (250–300 kg/ha)"
+        
+    elif n_status_score <= 350:
         kategori = "Tinggi"
-        saran_pupuk = "Cukup 300–350 kg/ha"
+        final_dose = 225  # Turunkan dosis
+        rekomendasi_text = "Tanah subur. Kurangi dosis (Cukup 200-250 kg/ha)"
+        
     else:
         kategori = "Sangat Tinggi"
-        saran_pupuk = "Kurangi dosis (Maks 300 kg/ha)" # <-- Lebih jelas kalimatnya
+        final_dose = 150
+        rekomendasi_text = "Sangat subur! Hemat pupuk (≤ 200 kg/ha)"
 
+    # 3. Return Hasil
     return {
         "status": "success",
         "prediction": {
             "n_rel_index": float(n_rel_val),
-            "urea_kg_ha": float(current_n_status), # Tetap kirim angka statusnya
+            "urea_kg_ha": float(final_dose),       # Mengirim angka Dosis Rekomendasi (bukan skor status)
+            "status_score": float(n_status_score), # Info tambahan: Skor Status Asli
             "kategori": kategori,
-            "rekomendasi": saran_pupuk # Kalimat saran yang lebih manusiawi
+            "rekomendasi": rekomendasi_text        # Variabel ini sekarang konsisten
         }
     }
 
@@ -110,8 +125,6 @@ def predict_nitrogen(payload: PredictionInput):
         raise HTTPException(status_code=500, detail=str(e))
 
 # --- 5. ENDPOINT CSV (OPTIMIZED) ---
-# Menggunakan 'def' biasa (bukan async def) agar FastAPI menjalankan ini di threadpool.
-# Ini mencegah server 'hang' saat memproses file CSV yang berat (CPU-bound task).
 @app.post("/predict-csv")
 def predict_nitrogen_from_csv(
     file: UploadFile = File(...), 
@@ -122,8 +135,7 @@ def predict_nitrogen_from_csv(
     if not model or not sc_dyn:
         raise HTTPException(status_code=503, detail="Model/Scalers not initialized.")
 
-    # 1. Validasi Tipe File (DILONGGARKAN)
-    # Cukup cek ekstensi file saja, abaikan content_type header yang kadang membingungkan
+    # 1. Validasi Tipe File
     if not file.filename.lower().endswith('.csv'):
         print(f"DEBUG: File ditolak karena ekstensi bukan .csv ({file.filename})")
         raise HTTPException(status_code=400, detail="File harus berformat .csv")
@@ -145,7 +157,6 @@ def predict_nitrogen_from_csv(
         
         if df_loc.empty:
             print(f"DEBUG: Lokasi '{location_name}' tidak ada di data.")
-            # List lokasi yang tersedia untuk info debug
             available = df['NAME_3'].unique()[:5] 
             raise HTTPException(status_code=404, detail=f"Lokasi '{location_name}' tidak ditemukan. Tersedia: {available}...")
 
@@ -157,19 +168,17 @@ def predict_nitrogen_from_csv(
         df_loc = df_loc.sort_values('period_start')
         df_loc.set_index('period_start', inplace=True)
 
-        # --- DEBUG GAP CHECK (DILONGGARKAN) ---
+        # --- DEBUG GAP CHECK ---
         time_diff = df_loc.index.to_series().diff().dt.days
         max_gap = time_diff.max()
         print(f"DEBUG: Max gap data untuk {location_name} adalah {max_gap} hari.")
         
-        # Jika gap > 60 hari (misalnya), kita hanya print warning tapi tetap lanjut
         if max_gap > 60:
              print(f"WARNING: Data {location_name} memiliki gap besar ({max_gap} hari). Hasil interpolasi mungkin bias.")
 
         # --- AUTO-REPAIR ---
         numeric_cols = df_loc.select_dtypes(include=[np.number]).columns
         
-        # Resample & Interpolate
         df_resampled = df_loc[numeric_cols].resample('15D').mean().interpolate(method='linear')
         df_resampled = df_resampled.bfill(limit=3).ffill(limit=3)
 
@@ -203,7 +212,9 @@ def predict_nitrogen_from_csv(
         y_pred_scaled = model.predict([X_dyn_final, X_stat_final])
         y_pred_real = sc_y.inverse_transform(y_pred_scaled).flatten()[0]
 
+        # Generate Recommendation
         result = generate_recommendation(y_pred_real)
+        
         result['meta'] = {
             "location": location_name,
             "period_start": str(df_window['period_start'].iloc[0].date()),
@@ -214,7 +225,6 @@ def predict_nitrogen_from_csv(
         return result
 
     except HTTPException as he:
-        # Re-raise agar client dapat status code yang benar
         raise he
     except Exception as e:
         traceback.print_exc()
@@ -225,5 +235,4 @@ def predict_nitrogen_from_csv(
 
 if __name__ == "__main__":
     import uvicorn
-    # Workers > 1 disarankan untuk production deployment
     uvicorn.run(app, host="0.0.0.0", port=8000)
