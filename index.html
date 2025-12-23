@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="id">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Sistem Prediksi Nitrogen & Pupuk</title>
+    <style>
+      :root {
+        --primary: #2e7d32; /* Hijau Pertanian */
+        --light: #f1f8e9;
+        --dark: #1b5e20;
+        --danger: #d32f2f;
+        --warning: #f57c00;
+      }
+      body {
+        font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+        background-color: #f5f5f5;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        min-height: 100vh;
+        margin: 0;
+      }
+      .container {
+        background: white;
+        padding: 2rem;
+        border-radius: 15px;
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
+        width: 100%;
+        max-width: 500px;
+      }
+      h2 {
+        text-align: center;
+        color: var(--dark);
+        margin-bottom: 1.5rem;
+      }
+
+      .form-group {
+        margin-bottom: 1rem;
+      }
+      label {
+        display: block;
+        margin-bottom: 0.5rem;
+        font-weight: bold;
+        color: #555;
+      }
+      input[type="text"],
+      input[type="file"] {
+        width: 100%;
+        padding: 10px;
+        border: 2px solid #ddd;
+        border-radius: 8px;
+        box-sizing: border-box;
+      }
+      button {
+        width: 100%;
+        padding: 12px;
+        background-color: var(--primary);
+        color: white;
+        border: none;
+        border-radius: 8px;
+        font-size: 1rem;
+        cursor: pointer;
+        transition: 0.3s;
+      }
+      button:hover {
+        background-color: var(--dark);
+      }
+      button:disabled {
+        background-color: #ccc;
+      }
+
+      /* Hasil Styles */
+      #result-card {
+        margin-top: 1.5rem;
+        padding: 1rem;
+        border-radius: 10px;
+        background-color: var(--light);
+        display: none; /* Sembunyi default */
+        border-left: 5px solid var(--primary);
+      }
+      .result-item {
+        margin-bottom: 0.5rem;
+        display: flex;
+        justify-content: space-between;
+      }
+      .label-res {
+        color: #666;
+      }
+      .value-res {
+        font-weight: bold;
+        color: #333;
+      }
+
+      .status-section {
+        text-align: center;
+        margin-bottom: 15px;
+      }
+      .status-value {
+        font-size: 1.4rem;
+        color: var(--dark);
+        font-weight: 800;
+      }
+
+      .recommendation-section {
+        text-align: center;
+        margin-top: 15px;
+        padding-top: 10px;
+        border-top: 2px dashed #ccc;
+      }
+      .rec-label {
+        font-size: 0.9rem;
+        color: var(--danger);
+        font-weight: bold;
+        margin-bottom: 5px;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+      }
+      .rec-value {
+        font-size: 1.1rem;
+        font-weight: bold;
+        color: #c62828;
+        background: #ffebee;
+        padding: 8px;
+        border-radius: 5px;
+        display: inline-block;
+      }
+
+      .error {
+        color: #d32f2f;
+        background: #ffebee;
+        padding: 10px;
+        border-radius: 5px;
+        margin-top: 1rem;
+        display: none;
+      }
+      .loader {
+        display: none;
+        text-align: center;
+        margin-top: 10px;
+        color: var(--primary);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h2>🌾 Prediksi Pupuk Pintar</h2>
+
+      <form id="predictionForm">
+        <div class="form-group">
+          <label for="location">Nama Lokasi (Sesuai CSV):</label>
+          <input
+            type="text"
+            id="location"
+            placeholder="Contoh: Sukra, Arahan..."
+            required
+          />
+        </div>
+
+        <div class="form-group">
+          <label for="csvFile">Upload Dataset (.csv):</label>
+          <input type="file" id="csvFile" accept=".csv" required />
+        </div>
+
+        <button type="submit" id="btnSubmit">🔍 Analisa Sekarang</button>
+      </form>
+
+      <div class="loader" id="loader">Sedang menganalisa data tanah...</div>
+
+      <div class="error" id="errorMessage"></div>
+
+      <div id="result-card">
+        <div style="text-align: center; margin-bottom: 20px">
+          <span
+            style="
+              background: #e8f5e9;
+              color: var(--dark);
+              padding: 5px 15px;
+              border-radius: 20px;
+              font-size: 0.85rem;
+              font-weight: bold;
+            "
+          >
+            HASIL ANALISIS
+          </span>
+        </div>
+
+        <div class="result-item">
+          <span class="label-res">Indeks N Relatif:</span>
+          <span class="value-res" id="resIndex">-</span>
+        </div>
+        <div class="result-item">
+          <span class="label-res">Kategori Kesuburan:</span>
+          <span class="value-res" id="resCategory">-</span>
+        </div>
+
+        <div class="status-section">
+          <div style="font-size: 0.9rem; color: #666; margin-bottom: 2px">
+            Status Nitrogen Terukur (Setara Urea)
+          </div>
+          <div class="status-value" id="resStatusUrea">- kg/ha</div>
+        </div>
+
+        <div class="recommendation-section">
+          <div class="rec-label">Saran Pemupukan</div>
+          <div class="rec-value" id="resRecommendation">-</div>
+        </div>
+
+        <div
+          style="
+            margin-top: 15px;
+            font-size: 0.75rem;
+            color: #999;
+            text-align: center;
+          "
+        >
+          Periode Data: <span id="resDate"></span>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const form = document.getElementById("predictionForm");
+      const resultCard = document.getElementById("result-card");
+      const errorMsg = document.getElementById("errorMessage");
+      const loader = document.getElementById("loader");
+      const btn = document.getElementById("btnSubmit");
+
+      form.addEventListener("submit", async (e) => {
+        e.preventDefault();
+
+        // 1. Ambil Data Form
+        const location = document.getElementById("location").value;
+        const fileInput = document.getElementById("csvFile").files[0];
+
+        if (!fileInput) {
+          alert("Harap pilih file CSV!");
+          return;
+        }
+
+        // 2. Siapkan FormData
+        const formData = new FormData();
+        formData.append("location_name", location);
+        formData.append("file", fileInput);
+
+        // 3. UI Loading State
+        btn.disabled = true;
+        btn.textContent = "Memproses...";
+        loader.style.display = "block";
+        resultCard.style.display = "none";
+        errorMsg.style.display = "none";
+
+        try {
+          // 4. Kirim Request ke API
+          // Pastikan server python main.py sudah berjalan di port 8000
+          const response = await fetch("http://localhost:8000/predict-csv", {
+            method: "POST",
+            body: formData,
+          });
+
+          const data = await response.json();
+
+          if (!response.ok) {
+            throw new Error(data.detail || "Terjadi kesalahan pada server");
+          }
+
+          // 5. Tampilkan Hasil (Mapping Data)
+          document.getElementById("resIndex").textContent =
+            data.prediction.n_rel_index.toFixed(2);
+          document.getElementById("resCategory").textContent =
+            data.prediction.kategori;
+
+          // Label Status (Angka Tinggi)
+          document.getElementById("resStatusUrea").textContent =
+            data.prediction.urea_kg_ha.toFixed(0) + " kg/ha";
+
+          // Label Saran (Teks Rekomendasi)
+          // Hapus tanda kurung jika ada, agar lebih bersih
+          let recText = data.prediction.rekomendasi;
+          document.getElementById("resRecommendation").textContent = recText;
+
+          // Info Tanggal
+          if (data.meta) {
+            document.getElementById(
+              "resDate"
+            ).textContent = `${data.meta.period_start} s/d ${data.meta.period_end}`;
+          }
+
+          resultCard.style.display = "block";
+        } catch (err) {
+          // Handle Error
+          errorMsg.textContent = "❌ Error: " + err.message;
+          errorMsg.style.display = "block";
+        } finally {
+          // Reset UI
+          btn.disabled = false;
+          btn.textContent = "🔍 Analisa Sekarang";
+          loader.style.display = "none";
+        }
+      });
+    </script>
+  </body>
+</html>

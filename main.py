@@ -2,21 +2,33 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 import joblib
-import io
 import traceback
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+import sys
 from pydantic import BaseModel
 from typing import List
+import os
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
 
 # Inisialisasi App
 app = FastAPI(title="N-Prediction API")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Mengizinkan semua akses
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # --- 1. LOAD MODEL & SCALERS ---
+# Load resources sekali saat startup agar efisien
 try:
     model = tf.keras.models.load_model('model/lstm_N_model.h5')
     print("✅ Model loaded successfully.")
 except Exception as e:
     print(f"❌ Error loading model: {e}")
+    model = None # Handle jika model gagal load
 
 try:
     sc_dyn = joblib.load('model/scaler_dynamic.pkl')
@@ -25,181 +37,193 @@ try:
     print("✅ Scalers loaded successfully.")
 except Exception as e:
     print(f"❌ Error loading scalers: {e}")
+    sc_dyn = sc_stat = sc_y = None
 
-# --- 2. DEFINE INPUT SCHEMA (Untuk JSON Manual) ---
+# --- 2. DEFINE INPUT SCHEMA ---
 class PredictionInput(BaseModel):
-    # Data Dinamis: 24 periode (per 15 hari)
     dynamic_data: List[List[float]] 
-    # Data Statis: 6 fitur tanah
     static_data: List[float]
 
-# --- 3. HELPER FUNCTION (Logic Rekomendasi) ---
+# --- 3. HELPER FUNCTION ---
 def generate_recommendation(n_rel_val):
-    """Fungsi pembantu untuk menghitung rekomendasi pupuk"""
-    # Rumus: 275 + (N_rel * 62.5)
-    urea_kg_ha = 275 + (n_rel_val * 62.5)
-    
-    # Clip (Batasi nilai 200 - 400)
-    urea_kg_ha = max(200, min(400, urea_kg_ha))
+    # Hitung estimasi kandungan N saat ini (dikonversi ke satuan kg/ha Urea)
+    current_n_status = 275 + (n_rel_val * 62.5) 
+    current_n_status = max(200, min(400, current_n_status))
 
-    # Kategori
-    if urea_kg_ha <= 200:
+    # Tentukan rekomendasi pupuk BERDASARKAN status tadi
+    if current_n_status <= 200:
         kategori = "Sangat Rendah"
-        rekomendasi_text = "≥ 350 kg/ha"
-    elif urea_kg_ha <= 250:
+        saran_pupuk = "Tambahkan ≥ 350 kg/ha"
+    elif current_n_status <= 250:
         kategori = "Rendah"
-        rekomendasi_text = "200–250 kg/ha"
-    elif urea_kg_ha <= 300:
+        saran_pupuk = "Tambahkan 200–250 kg/ha"
+    elif current_n_status <= 300:
         kategori = "Sedang"
-        rekomendasi_text = "250–300 kg/ha (standar)"
-    elif urea_kg_ha <= 350:
+        saran_pupuk = "Tambahkan 250–300 kg/ha (Standar)"
+    elif current_n_status <= 350:
         kategori = "Tinggi"
-        rekomendasi_text = "300–350 kg/ha"
+        saran_pupuk = "Cukup 300–350 kg/ha"
     else:
         kategori = "Sangat Tinggi"
-        rekomendasi_text = "≤ 300 kg/ha (kurangi dosis)"
+        saran_pupuk = "Kurangi dosis (Maks 300 kg/ha)" # <-- Lebih jelas kalimatnya
 
     return {
         "status": "success",
         "prediction": {
             "n_rel_index": float(n_rel_val),
-            "urea_kg_ha": float(urea_kg_ha),
+            "urea_kg_ha": float(current_n_status), # Tetap kirim angka statusnya
             "kategori": kategori,
-            "rekomendasi": rekomendasi_text
+            "rekomendasi": saran_pupuk # Kalimat saran yang lebih manusiawi
         }
     }
 
-# --- 4. ENDPOINT JSON (ORIGINAL) ---
+# --- 4. ENDPOINT JSON (Manual Input) ---
 @app.post("/predict")
 def predict_nitrogen(payload: PredictionInput):
+    if not model or not sc_dyn:
+        raise HTTPException(status_code=503, detail="Model/Scalers not initialized.")
+
     try:
-        # A. VALIDASI
         if len(payload.dynamic_data) != 24:
-            raise HTTPException(status_code=400, detail="Dynamic data must be exactly 24 time steps (24 periods).")
+            raise HTTPException(status_code=400, detail="Dynamic data must be exactly 24 time steps.")
         
-        # B. PREPROCESSING
         X_dyn_raw = np.array(payload.dynamic_data)
         X_stat_raw = np.array(payload.static_data)
 
+        # Preprocessing
         X_dyn_scaled = sc_dyn.transform(X_dyn_raw)
         X_dyn_final = X_dyn_scaled.reshape(1, 24, 6)
 
         X_stat_scaled = sc_stat.transform(X_stat_raw.reshape(1, -1))
         X_stat_final = X_stat_scaled
 
-        # C. PREDIKSI
+        # Prediksi
         y_pred_scaled = model.predict([X_dyn_final, X_stat_final])
         y_pred_real = sc_y.inverse_transform(y_pred_scaled).flatten()[0]
 
-        # D. REKOMENDASI
         return generate_recommendation(y_pred_real)
 
+    except HTTPException as he:
+        raise he
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- 5. ENDPOINT CSV (BARU - DENGAN AUTO REPAIR) ---
+# --- 5. ENDPOINT CSV (OPTIMIZED) ---
+# Menggunakan 'def' biasa (bukan async def) agar FastAPI menjalankan ini di threadpool.
+# Ini mencegah server 'hang' saat memproses file CSV yang berat (CPU-bound task).
 @app.post("/predict-csv")
-async def predict_nitrogen_from_csv(
+def predict_nitrogen_from_csv(
     file: UploadFile = File(...), 
     location_name: str = Form(...)
 ):
+    print(f"DEBUG: Menerima request untuk lokasi '{location_name}' dengan file '{file.filename}'")
+
+    if not model or not sc_dyn:
+        raise HTTPException(status_code=503, detail="Model/Scalers not initialized.")
+
+    # 1. Validasi Tipe File (DILONGGARKAN)
+    # Cukup cek ekstensi file saja, abaikan content_type header yang kadang membingungkan
+    if not file.filename.lower().endswith('.csv'):
+        print(f"DEBUG: File ditolak karena ekstensi bukan .csv ({file.filename})")
+        raise HTTPException(status_code=400, detail="File harus berformat .csv")
+
     try:
-        # 1. Baca File CSV
-        contents = await file.read()
-        df = pd.read_csv(io.BytesIO(contents))
-        
-        # 2. Filter Lokasi
+        # 2. Baca File
+        try:
+            df = pd.read_csv(file.file)
+        except Exception as e:
+             print(f"DEBUG: Gagal membaca CSV. Error: {e}")
+             raise HTTPException(status_code=400, detail="Gagal membaca file CSV. Pastikan format benar.")
+
+        # 3. Filter Lokasi
         if 'NAME_3' not in df.columns:
-            raise HTTPException(status_code=400, detail="Kolom 'NAME_3' tidak ditemukan di CSV.")
+            print("DEBUG: Kolom 'NAME_3' tidak ditemukan di CSV.")
+            raise HTTPException(status_code=400, detail="Kolom 'NAME_3' tidak ditemukan.")
             
         df_loc = df[df['NAME_3'] == location_name].copy()
         
         if df_loc.empty:
-            raise HTTPException(status_code=404, detail=f"Lokasi '{location_name}' tidak ditemukan di dataset.")
+            print(f"DEBUG: Lokasi '{location_name}' tidak ada di data.")
+            # List lokasi yang tersedia untuk info debug
+            available = df['NAME_3'].unique()[:5] 
+            raise HTTPException(status_code=404, detail=f"Lokasi '{location_name}' tidak ditemukan. Tersedia: {available}...")
 
-        # 3. Urutkan & Indexing Waktu
+        # 4. Processing Waktu
         if 'period_start' not in df_loc.columns:
              raise HTTPException(status_code=400, detail="Kolom 'period_start' wajib ada.")
              
-        # Konversi ke datetime
         df_loc['period_start'] = pd.to_datetime(df_loc['period_start'])
         df_loc = df_loc.sort_values('period_start')
-        
-        # Set tanggal sebagai index agar bisa di-resample
         df_loc.set_index('period_start', inplace=True)
 
-        # --- 4. AUTO-REPAIR: Resampling & Interpolasi ---
-        # Memaksa data menjadi frekuensi 15 Harian. 
-        # Jika data bolong, baris baru dibuat dengan nilai NaN, lalu diisi interpolasi.
+        # --- DEBUG GAP CHECK (DILONGGARKAN) ---
+        time_diff = df_loc.index.to_series().diff().dt.days
+        max_gap = time_diff.max()
+        print(f"DEBUG: Max gap data untuk {location_name} adalah {max_gap} hari.")
         
-        # Ambil hanya kolom numerik untuk diinterpolasi
+        # Jika gap > 60 hari (misalnya), kita hanya print warning tapi tetap lanjut
+        if max_gap > 60:
+             print(f"WARNING: Data {location_name} memiliki gap besar ({max_gap} hari). Hasil interpolasi mungkin bias.")
+
+        # --- AUTO-REPAIR ---
         numeric_cols = df_loc.select_dtypes(include=[np.number]).columns
         
-        # Resample per 15 hari ('15D') -> Interpolasi Linear -> Isi sisa NaN dengan backfill/ffill
+        # Resample & Interpolate
         df_resampled = df_loc[numeric_cols].resample('15D').mean().interpolate(method='linear')
-        df_resampled = df_resampled.bfill().ffill()
+        df_resampled = df_resampled.bfill(limit=3).ffill(limit=3)
 
-        # Validasi jumlah data setelah perbaikan
         if len(df_resampled) < 24:
-             raise HTTPException(status_code=400, detail=f"Data kurang (bahkan setelah interpolasi). Hanya ada {len(df_resampled)} periode 15-harian.")
+             print(f"DEBUG: Data kurang. Hasil resample cuma {len(df_resampled)} baris.")
+             raise HTTPException(status_code=400, detail=f"Data kurang. Hanya tersedia {len(df_resampled)} periode 15-harian.")
              
-        # Ambil 24 periode terakhir (Window Size ~1 Tahun)
-        df_window = df_resampled.tail(24)
-        
-        # Kembalikan period_start menjadi kolom biasa (untuk info meta)
-        df_window = df_window.reset_index()
+        df_window = df_resampled.tail(24).reset_index()
 
-        # --- 5. Validasi Kolom Fitur ---
+        # 5. Validasi Kolom Fitur
         dynamic_cols = ['NDVI', 'EVI', 'OSAVI', 'LST_mean', 'SoilMoisture', 'precip_sum']
         static_cols = ['pH', 'SOC', 'cec', 'clay', 'sand', 'elevation_m']
         
         missing = [c for c in dynamic_cols + static_cols if c not in df_window.columns]
         if missing:
-             raise HTTPException(status_code=400, detail=f"Kolom fitur hilang di CSV: {missing}")
+             print(f"DEBUG: Kolom hilang: {missing}")
+             raise HTTPException(status_code=400, detail=f"Kolom fitur hilang: {missing}")
 
-        # --- 6. Persiapan Data untuk Model ---
+        # 6. Prediksi
         X_dyn_raw = df_window[dynamic_cols].values 
-        X_stat_raw = df_window[static_cols].iloc[-1].values # Ambil statis dari data terakhir
+        X_stat_raw = df_window[static_cols].iloc[-1].values
 
-        # Cek NaN terakhir kali (Safety Check)
-        if np.isnan(X_dyn_raw).any() or np.isnan(X_stat_raw).any():
-             raise HTTPException(status_code=400, detail="Data mengandung nilai NaN yang tidak bisa diperbaiki. Cek kualitas data CSV.")
-
-        # --- 7. Scaling & Prediksi ---
+        # Scaling
         X_dyn_scaled = sc_dyn.transform(X_dyn_raw)
         X_dyn_final = X_dyn_scaled.reshape(1, 24, 6)
 
         X_stat_scaled = sc_stat.transform(X_stat_raw.reshape(1, -1))
         X_stat_final = X_stat_scaled
 
+        # Inference
         y_pred_scaled = model.predict([X_dyn_final, X_stat_final])
         y_pred_real = sc_y.inverse_transform(y_pred_scaled).flatten()[0]
 
-        # --- 8. Output ---
         result = generate_recommendation(y_pred_real)
-        
-        # Info Meta Data
-        start_date = df_window['period_start'].iloc[0]
-        end_date = df_window['period_start'].iloc[-1]
-        days_diff = (end_date - start_date).days
-
         result['meta'] = {
             "location": location_name,
-            "data_period_start": str(start_date.date()),
-            "data_period_end": str(end_date.date()),
-            "total_days_covered": days_diff,
-            "note": "Data telah melalui proses resampling & interpolasi otomatis (15-hari)."
+            "period_start": str(df_window['period_start'].iloc[0].date()),
+            "period_end": str(df_window['period_start'].iloc[-1].date()),
+            "debug_max_gap_days": float(max_gap) if not pd.isna(max_gap) else 0
         }
         
         return result
 
+    except HTTPException as he:
+        # Re-raise agar client dapat status code yang benar
+        raise he
     except Exception as e:
         traceback.print_exc()
+        print(f"DEBUG: Unhandled Exception: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        file.file.close()
 
-# --- MAIN EXECUTION BLOCK ---
 if __name__ == "__main__":
     import uvicorn
-    # Jalankan server
+    # Workers > 1 disarankan untuk production deployment
     uvicorn.run(app, host="0.0.0.0", port=8000)

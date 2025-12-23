@@ -7,7 +7,7 @@ url = "http://localhost:8000/predict-csv"
 file_path = "dataset.csv" 
 
 # Lokasi yang ingin dites (harus ada di kolom NAME_3 di CSV)
-lokasi = "Arahan"
+lokasi = "Kedokan Bunder"
 
 try:
     # Buka file dalam mode binary ('rb')
